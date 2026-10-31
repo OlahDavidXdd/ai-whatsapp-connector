@@ -19,8 +19,19 @@ Expose it over HTTPS (host it, or use a tunnel such as `ngrok http 8000` for tes
 | any text | Sent to your default model |
 | `/gpt <msg>` | One message to GPT |
 | `/claude <msg>` | One message to Claude |
-| `/use gpt` / `/use claude` | Change your default model |
+| `/use` | Show your current default and its model/effort |
+| `/use claude sonnet medium` | Default to Claude Sonnet 5.5 at medium effort |
+| `/use gpt best low` | Default to the best GPT model at low effort |
+| `/use gpt small` | Default to the smallest GPT model |
+| `/use claude high` | Change only the effort (keeps the model) |
 | `/reset` | Clear your default model's history |
 | `/help` | Show commands |
+
+`/use <gpt\|claude> [model] [effort]` takes the model and effort in any order, and each provider remembers its own settings per phone number.
+
+- **GPT models:** `small` (`gpt-5.4-nano`, the default), `mini` (`gpt-5.4-mini`), `best` (`gpt-6-astra`)
+- **Claude models:** `sonnet` (`claude-sonnet-5-5`, the default), `opus`, `haiku`, `fable`
+- **Any model ID** also works, e.g. `/use gpt gpt-5.4-mini`
+- **Effort:** `low`, `medium`, `high`, `xhigh`, `max` (GPT also accepts `none`); `default` clears it. Which levels a given model accepts is up to the API; if it rejects one, the reply shows the error.
 
 Set `ALLOWED_PHONE_NUMBERS` to restrict who can use the bot. `GET /health` returns `{"ok": true}`.

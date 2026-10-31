@@ -26,7 +26,7 @@ META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 WA_API_VERSION = os.getenv("WHATSAPP_API_VERSION", "v22.0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-nano")  # smallest GPT model
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 
@@ -39,6 +39,32 @@ ALLOWED_NUMBERS = {
 }
 
 FALLBACK_REPLY = "I couldn't produce a text response."
+
+PROVIDERS = ("gpt", "claude")
+DEFAULT_MODELS = {"gpt": OPENAI_MODEL, "claude": ANTHROPIC_MODEL}
+
+# Shortcuts for `/use <provider> <shortcut> <effort>`. Any raw model ID also works.
+MODEL_ALIASES = {
+    "gpt": {
+        "small": "gpt-5.4-nano",
+        "nano": "gpt-5.4-nano",
+        "mini": "gpt-5.4-mini",
+        "best": "gpt-6-astra",
+        "astra": "gpt-6-astra",
+    },
+    "claude": {
+        "sonnet": "claude-sonnet-5-5",
+        "opus": "claude-opus-5-5",
+        "haiku": "claude-haiku-5-5",
+        "fable": "claude-fable-5-1",
+    },
+}
+# Reasoning effort levels each API accepts ("default" clears the setting).
+EFFORTS = {
+    "gpt": {"none", "low", "medium", "high", "xhigh", "max"},
+    "claude": {"low", "medium", "high", "xhigh", "max"},
+}
+ALL_EFFORTS = EFFORTS["gpt"] | EFFORTS["claude"]
 
 
 @contextmanager
@@ -58,6 +84,15 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 phone TEXT PRIMARY KEY,
                 provider TEXT NOT NULL DEFAULT 'gpt'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS provider_settings (
+                phone TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                effort TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (phone, provider)
             )
         """)
         conn.execute("""
@@ -100,6 +135,36 @@ def set_default_provider(phone, provider):
         """, (phone, provider))
 
 
+def get_provider_settings(phone, provider):
+    """Return (model, effort); effort is None when unset."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT model, effort FROM provider_settings WHERE phone = ? AND provider = ?",
+            (phone, provider),
+        ).fetchone()
+    model, effort = row if row else ("", "")
+    return model or DEFAULT_MODELS[provider], effort or None
+
+
+def set_provider_settings(phone, provider, model=None, effort=None):
+    """Update only the fields given. effort="" clears it."""
+    cur_model, cur_effort = get_provider_settings(phone, provider)
+    model = model or cur_model
+    effort = cur_effort if effort is None else effort
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO provider_settings(phone, provider, model, effort)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(phone, provider) DO UPDATE SET
+                model = excluded.model, effort = excluded.effort
+        """, (phone, provider, model, effort or ""))
+
+
+def describe_settings(phone, provider):
+    model, effort = get_provider_settings(phone, provider)
+    return f"{model} ({effort} effort)" if effort else model
+
+
 def get_history(phone, provider):
     with db() as conn:
         rows = conn.execute("""
@@ -132,14 +197,18 @@ def clear_history(phone, provider):
         )
 
 
-def ask_gpt(history):
+def ask_gpt(history, model, effort=None):
+    body = {"model": model, "input": history}
+    if effort:
+        body["reasoning"] = {"effort": effort}
+
     response = requests.post(
         "https://api.openai.com/v1/responses",
         headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={"model": OPENAI_MODEL, "input": history},
+        json=body,
         timeout=90,
     )
     response.raise_for_status()
@@ -157,7 +226,11 @@ def ask_gpt(history):
     return "\n".join(text).strip() or FALLBACK_REPLY
 
 
-def ask_claude(history):
+def ask_claude(history, model, effort=None):
+    body = {"model": model, "max_tokens": 1200, "messages": history}
+    if effort:
+        body["output_config"] = {"effort": effort}
+
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -165,11 +238,7 @@ def ask_claude(history):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
-        json={
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": 1200,
-            "messages": history,
-        },
+        json=body,
         timeout=90,
     )
     response.raise_for_status()
@@ -209,11 +278,42 @@ HELP_TEXT = (
     "Text normally to use your default AI. Commands:\n"
     "/gpt your message\n"
     "/claude your message\n"
-    "/use gpt\n"
-    "/use claude\n"
+    "/use - show current settings\n"
+    "/use claude sonnet medium\n"
+    "/use gpt best low\n"
+    "/use gpt small\n"
+    "/use claude high (effort only)\n"
+    "Models: gpt small|mini|best, claude sonnet|opus|haiku|fable, or any model ID. "
+    "Effort: low|medium|high|xhigh|max (gpt also none), default = clear.\n"
     "/reset\n"
     "/help"
 )
+
+
+def handle_use(phone, args):
+    """/use [provider] [model] [effort] -> reply text."""
+    if not args:
+        provider = get_default_provider(phone)
+        return f"Default: {provider} - {describe_settings(phone, provider)}"
+
+    provider = args[0]
+    if provider not in PROVIDERS:
+        return "Use /use gpt or /use claude, optionally followed by a model and effort. Send /help for examples."
+
+    model, effort = None, None
+    for token in args[1:]:
+        if token == "default":
+            effort = ""
+        elif token in ALL_EFFORTS:
+            if token not in EFFORTS[provider]:
+                return f"{provider} doesn't support '{token}' effort."
+            effort = token
+        else:
+            model = MODEL_ALIASES[provider].get(token, token)
+
+    set_default_provider(phone, provider)
+    set_provider_settings(phone, provider, model, effort)
+    return f"Default set to {provider} - {describe_settings(phone, provider)}"
 
 
 def handle_message(phone, text):
@@ -229,10 +329,8 @@ def handle_message(phone, text):
             send_whatsapp(phone, "Cleared your default model's chat history.")
             return
 
-        if command in ("/use gpt", "/use claude"):
-            provider = command.split()[1]
-            set_default_provider(phone, provider)
-            send_whatsapp(phone, f"Default model set to {provider}.")
+        if command == "/use" or command.startswith("/use "):
+            send_whatsapp(phone, handle_use(phone, command.split()[1:]))
             return
 
         provider = get_default_provider(phone)
@@ -252,16 +350,21 @@ def handle_message(phone, text):
         history = get_history(phone, provider) + [
             {"role": "user", "content": prompt}
         ]
-        answer = ask_gpt(history) if provider == "gpt" else ask_claude(history)
+        model, effort = get_provider_settings(phone, provider)
+        ask = ask_gpt if provider == "gpt" else ask_claude
+        answer = ask(history, model, effort)
         save_turns(phone, provider, [("user", prompt), ("assistant", answer)])
-        send_whatsapp(phone, f"[{provider.upper()}]\n{answer}")
+        send_whatsapp(phone, f"[{model}{' · ' + effort if effort else ''}]\n{answer}")
 
-    except Exception:
+    except Exception as exc:
         log.exception("Failed to process incoming message")
+        detail = ""
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            detail = f" ({exc.response.status_code}: {exc.response.text[:200]})"
         try:
             send_whatsapp(
                 phone,
-                "Sorry, that request failed. Check the connector's server logs and try again.",
+                f"Sorry, that request failed{detail}. Check the connector's server logs and try again.",
             )
         except Exception:
             log.exception("Could not send error reply")
